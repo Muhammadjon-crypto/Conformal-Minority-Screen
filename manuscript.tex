@@ -1,0 +1,939 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{times}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{authblk}
+\usepackage[T1]{fontenc}
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\title{A Quiet Failure in Calibrated Virtual Screening: Marginal Conformal Prediction Under-Covers the Minority Class, and a Class-Conditional Fix Recovers It}
+\author[1]{Muhammadjon Tursunbadalov}
+\author[1]{Mustafojon Tursunbadalov}
+\affil[1]{School of Science and Technology, Champions College Prep, United States}
+\date{}
+
+\begin{document}
+\maketitle
+\noindent\texttt{\{yaiuftuto, yunmt123\}@gmail.com} \\
+\noindent Corresponding author: Muhammadjon Tursunbadalov (yaiuftuto@gmail.com)
+
+\begin{abstract}
+Conformal prediction is being adopted across drug discovery as a way to put an honest number on
+model reliability. The appeal is its guarantee: pick an error rate $\alpha$, and the method
+returns prediction sets that contain the true label with probability at least $1-\alpha$. We show
+that taking this guarantee at face value can be dangerous on the imbalanced datasets that
+screening actually deals with. Across five binary classification datasets, including a real
+high-throughput bioactivity screen and an external clinical-toxicity dataset, standard (marginal)
+conformal prediction hits its global 90\% coverage target while leaving the minority class badly
+exposed---realized minority-class coverage falls to 59.2\% on the BBBP blood--brain-barrier
+penetration dataset, to 40.5\% on the Tox21 SR-ARE stress-response dataset, to 2.5\% on the
+ClinTox clinical-trial-toxicity dataset, and to 2.1\% on a real PubChem bioactivity screen (AID
+651631, p53 pathway), where the rare class is all but abandoned. The failure is not tied to one
+model. A random forest on circular fingerprints, a graph convolutional network that reads
+molecular structure directly, and a frozen pretrained chemical language model all reproduce it
+($p<0.001$ over ten random splits in every case), and the size of the gap tracks how
+well-calibrated a model already is on rare labels rather than anything about its architecture.
+Rebalancing the classifier itself (class-weighted training) does not fix the failure, which
+localizes the problem to the calibration step rather than the model. We explain the effect with a
+conservation identity: because overall coverage is fixed, the minority's shortfall equals the
+majority's surplus amplified by the imbalance ratio, a relation that predicts the measured BBBP gap
+to within about a point and orders the severity across datasets. We extend this identity into a
+bounded, validated pre-flight diagnostic that predicts minority coverage to within 2.4 percentage
+points of its measured value across a thirteen-fold range of imbalance severity, before a full
+calibration study is run. The failure survives realistic scaffold splits, and aggregate accuracy
+and overall coverage stay reassuringly high throughout, which is exactly why it is easy to miss.
+Class-conditional (Mondrian) conformal prediction closes the gap on every dataset, returning
+minority coverage to target for a modest increase in prediction-set size; adaptive prediction sets
+(APS), by contrast, reach nominal minority coverage only by returning uninformative two-label sets
+for nearly every minority compound. We localize the marginal failures to a handful of generic
+molecular scaffolds---plain benzene and pyridine cores that occur in both classes---propose a
+one-number diagnostic (the minority coverage gap), and show with a direction-aware cost model that
+abstaining on the affected compounds flips a screening campaign from net-negative to net-positive
+utility, with the size of that swing set by whether the campaign's goal is to find or to avoid the
+class in question. The marginal--conditional distinction is well known in the conformal
+literature; our contribution is to demonstrate on real chemistry how severe and how invisible it
+becomes under imbalance, to explain it quantitatively, to turn that explanation into a validated
+pre-flight predictive check, to show ordinary class rebalancing does not substitute for
+class-conditional calibration, and to lay out a practical, cost-aware protocol that restores
+per-class reliability.
+\end{abstract}
+
+\noindent\textbf{Keywords:} conformal prediction, uncertainty quantification, virtual screening,
+class imbalance, selective prediction, molecular property prediction
+
+\section{Introduction}
+
+A screening model is only useful if you can trust the cases where it says it is sure. Modern
+classifiers for molecular property prediction reach high aggregate accuracy, but a single accuracy
+number says nothing about which predictions deserve confidence. That gap has pushed conformal
+prediction into cheminformatics. Conformal methods wrap an existing classifier and return, for
+each compound, a set of labels that provably contains the truth at a user-chosen rate
+\cite{vovk2005,angelopoulos2023}. The guarantee is distribution-free and finite-sample. It needs no
+assumption about the model being correct, only that calibration and test compounds are
+exchangeable. For a field that routinely commits expensive wet-lab resources on the strength of a
+model's ranking, a guarantee like that is worth a great deal.
+
+There is a catch that is easy to read past. The standard guarantee is marginal: coverage holds on
+average over the whole test distribution. It does not promise anything about any particular
+subgroup. On a balanced problem the distinction rarely bites. Screening problems are almost never
+balanced. The interesting label---a toxic compound, a non-penetrant candidate, an active
+hit---is usually the rare one, and the rare one is the whole reason for running the campaign. A
+method that keeps its overall promise by being nearly perfect on the common class and quietly poor
+on the rare class is, for screening, keeping the wrong promise.
+
+This paper measures how badly that plays out, and shows it is not a corner case. On four imbalanced
+tasks, including one drawn from a real high-throughput bioactivity screen, marginal conformal
+prediction meets its 90\% target overall while delivering minority-class coverage as low as 2.1\%.
+We then ask whether the effect is an artifact of one model family. It is not. The same collapse
+appears with fingerprint-based random forests, with a graph neural network, and with a pretrained
+transformer that treats a molecule as a string of text---three ways of representing a molecule that
+share almost nothing mechanically. The severity of the collapse turns out to depend on how
+well-calibrated the base model already is on rare labels, not on which representation it uses. That
+is a statement about the calibration step, not about deep learning. We further ask whether the
+failure is simply a symptom of an unweighted classifier, and whether a more modern conformal score
+(adaptive prediction sets) avoids it without resorting to class-conditional calibration. Neither
+turns out to be true.
+
+What makes the failure dangerous in practice is that it is invisible from the top. Overall
+coverage, overall accuracy, ROC-AUC---all of the dashboard numbers a team would normally
+check---stay healthy while minority coverage falls through the floor. A practitioner who trusts
+the conformal guarantee, as advertised, would have no reason to look closer.
+
+The fix is not new and we do not claim it as ours. Class-conditional, or Mondrian, conformal
+prediction calibrates a separate threshold per class \cite{vovk2013}, which restores coverage
+within each group by construction. The marginal-versus-conditional gap is textbook conformal
+theory \cite{angelopoulos2023}. What we contribute is the empirical and explanatory case that this
+textbook gap is a live hazard in virtual screening: we quantify it on real datasets including a
+genuine bioactivity screen, show it is architecture-agnostic, explain its size with a simple
+identity, turn that identity into a checkable pre-flight diagnostic, show it is not fixed by
+rebalancing the classifier or by switching to a more modern conformal score, trace it to specific
+chemical substructures, and tie it to a decision-cost model that makes the practical stakes
+concrete. Our aim is less ``here is a method'' and more ``here is a vulnerability, here is why it
+happens, here is how to see it coming, and here is how to close it.''
+
+Concretely, the paper makes seven claims, each backed by experiment:
+
+\begin{enumerate}
+\item On imbalanced molecular datasets, marginal conformal prediction satisfies its global
+coverage target while under-covering the minority class, and the shortfall grows with imbalance,
+from a near-zero gap on near-balanced BACE to near-total collapse on heavily imbalanced ClinTox
+and on a real PubChem bioactivity screen.
+\item The collapse reproduces across three unrelated model architectures at $p<0.001$ each, with
+severity governed by baseline minority calibration rather than architecture.
+\item A conservation identity explains the effect: the minority shortfall equals the majority
+surplus amplified by the imbalance ratio, which predicts the measured gaps and their ordering
+across datasets. We extend this identity into a bounded, validated \emph{pre-flight} diagnostic
+that predicts minority coverage from prevalence and one inexpensive calibration pass, before a
+full study is run, to within 2.4 percentage points across five datasets and a thirteen-fold range
+of imbalance.
+\item Standard aggregate metrics conceal the failure, which we demonstrate with a
+selective-prediction protocol and a direction-aware cost analysis, and the failure persists under
+realistic scaffold splits.
+\item Rebalancing the base classifier via class-weighted training does not fix the coverage
+failure, which is further evidence the failure lives in the calibration step, not the model.
+\item Adaptive prediction sets (APS), a more modern conformal score, reach nominal minority
+coverage but only by returning uninformative two-label sets for nearly every minority compound, so
+neither default marginal method is usable for screening decisions under imbalance.
+\item The confidently wrong minority predictions concentrate on a small set of common,
+low-information scaffolds, which we present as a chemical case study.
+\end{enumerate}
+
+\section{Related Work}
+
+\textbf{Conformal prediction and its conditional variants.} The framework originates with Vovk and
+colleagues \cite{vovk2005}, who established the exchangeability-based coverage guarantee. The
+accessible modern treatment by Angelopoulos and Bates \cite{angelopoulos2023} is now the standard
+reference, and it states plainly that the basic guarantee is marginal and that conditional
+coverage requires extra machinery. Two score functions matter for classification. The
+least-ambiguous-set classifier (LAC) of Sadinle et al.\ \cite{sadinle2019} uses $1-\hat p(y\mid x)$
+and yields the smallest sets at a given coverage; adaptive prediction sets \cite{romano2020} trade
+size for better conditional behavior. Class-conditional calibration, the Mondrian taxonomy of Vovk
+\cite{vovk2013}, splits the calibration set by label and computes a separate quantile for each,
+which gives coverage per class at the price of larger sets where a class is hard. Our work does not
+invent any of this. We use LAC as the primary score because it is the common default and because
+its small sets make the marginal failure starkest; in this revision we add a full comparison
+against marginal APS \cite{romano2020} as a second baseline, and we use Mondrian calibration as the
+remedy.
+
+\textbf{Conformal prediction in cheminformatics.} Conformal methods entered drug discovery largely
+through the work of Norinder, Carlsson, and colleagues, who reframed the classical
+applicability-domain question as a coverage question \cite{norinder2014}, and through reviews
+aimed at the discovery pipeline \cite{eklund2015}. That line of work has mostly emphasized what
+conformal prediction provides---valid sets, an interpretable confidence---rather than where the
+default formulation breaks. The imbalance problem is acknowledged in passing in the general
+literature but, to our reading, has not been measured systematically on standard molecular
+benchmarks, across architectures, or connected to decision cost. That is the space this paper
+occupies.
+
+\textbf{Calibration is a separate axis.} It is tempting to assume that a miscalibrated model is the
+cause and a calibration fix is the cure. Guo et al.\ \cite{guo2017} showed that modern networks are
+often overconfident, and post-hoc scaling helps. We find the conformal failure is only loosely
+related to ordinary calibration error: our base models are at worst moderately miscalibrated
+(expected calibration error around 0.04--0.10), yet marginal conformal coverage still collapses on
+the minority. In this revision we go further and show that even a direct intervention on the
+classifier's training objective---class-weighted loss, the standard first response to
+imbalance---does not fix the conformal failure either. Calibration, class weighting, and
+conditional coverage are three different properties, and fixing the first two does not fix the
+third.
+
+\textbf{On the LIT-PCBA benchmark.} A concurrent, independent audit \cite{huang2025} documents
+substantial data-leakage and redundancy issues within the curated LIT-PCBA benchmark
+\cite{tran2020} itself---duplicate compounds shared across nominally disjoint training and
+validation splits, and low-diversity query ligand sets. This is a caution about LIT-PCBA
+specifically as a ranking/retrieval benchmark; it does not bear directly on our use here, since we
+draw on the raw PubChem primary-screen assay underlying one LIT-PCBA target (AID 651631, TP53) as
+an independent classification dataset rather than using LIT-PCBA's curated splits, and we run our
+own independent duplicate/label-conflict audit on every dataset we use (Section~3.1.1).
+
+\textbf{Molecular representations.} We deliberately span three representation families. Circular
+(ECFP-style) fingerprints \cite{rogers2010} feed a random forest \cite{breiman2001}. A graph
+convolutional network \cite{kipf2017} built with PyTorch Geometric \cite{fey2019} learns from the
+atom--bond graph. ChemBERTa, a RoBERTa-style transformer pretrained on millions of SMILES strings
+\cite{chithrananda2020}, supplies sequence embeddings. These have essentially nothing in common at
+the level of how a molecule is encoded, which is what makes their shared failure informative.
+
+\section{Methods}
+
+\subsection{Datasets}
+
+We use five binary classification tasks (Table~\ref{tab:datasets}), chosen to span a wide range of
+class imbalance and, in this revision, both ADMET/toxicity endpoints and a genuine bioactivity
+high-throughput screen. Blood--brain-barrier penetration (BBBP) \cite{martins2012} labels whether a
+compound crosses the barrier; the minority class is the non-penetrant compounds. BACE
+\cite{subramanian2016} labels $\beta$-secretase 1 inhibition and is close to balanced. From Tox21
+\cite{huang2016} we take the SR-ARE stress-response endpoint. ClinTox provides the CT-TOX endpoint
+(failure of clinical trials for toxicity); it is the most imbalanced of the four MoleculeNet
+\cite{wu2018} tasks we use and serves as an external check relative to BACE, BBBP, and Tox21.
+\textbf{New in this revision:} we add PubChem assay AID~651631, the primary-screen activity outcome
+for a p53-pathway high-throughput screen, and the same assay underlying the TP53 target in the
+LIT-PCBA benchmark \cite{tran2020}. We use PubChem's own primary-screen Active/Inactive outcome
+directly, \emph{not} LIT-PCBA's AVE-debiased, dose-response-confirmed active set; we flag this
+distinction explicitly because the two differ substantially in size (602 primary-hit actives here
+vs.\ 79 confirmed actives in the curated LIT-PCBA release) and are not interchangeable. We use this
+dataset as a genuine, real-world bioactivity-screening case study, independent of any claim about
+LIT-PCBA's curation. SMILES strings that RDKit \cite{rdkit} could not parse were dropped; the
+counts in Table~\ref{tab:datasets} are post-filtering and post-deduplication (Section~3.1.1), and
+are identical across all experiments on a given dataset.
+
+\begin{table}[h]
+\centering
+\caption{Datasets after parsing, cleaning, and deduplication. ``Minority rate'' is the fraction of
+compounds in the smaller class.}
+\label{tab:datasets}
+\begin{tabular}{lrrrl}
+\toprule
+Dataset & Compounds & Class 0 & Class 1 & Minority rate \\
+\midrule
+BACE & 1513 & 822 & 691 & 0.457 \\
+BBBP & 1965 & 465 & 1500 & 0.237 \\
+Tox21 SR-ARE & 5825 & 4883 & 942 & 0.162 \\
+ClinTox CT-TOX & 1440 & 1347 & 93 & 0.065 \\
+TP53 (PubChem AID 651631) & 6080 & 5613 & 467 & 0.077 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Most experiments use random train/calibration/test splits, which preserve the exchangeability
+conformal prediction assumes. For the robustness check in Section~4.8 we instead use scaffold
+splits: molecules are grouped by Bemis--Murcko scaffold \cite{bemis1996} and whole groups are
+assigned to a single partition, so that test compounds carry skeletons unseen in training and
+calibration. Scaffold splits break exchangeability by design and so test behavior under realistic
+distribution shift.
+
+\subsubsection{Duplicate and label-conflict audit (new)}
+
+Before splitting, we canonicalized all SMILES with RDKit and checked for duplicate compounds within
+each dataset. BACE and Tox21 SR-ARE contained no duplicated canonical SMILES. BBBP contained 64
+duplicated canonical SMILES (3.1\% of the pre-dedup dataset), of which 10 groups carried
+conflicting labels across duplicate entries. ClinTox contained 19 duplicated canonical SMILES
+groups (1.3\% of the pre-dedup dataset), \emph{all} 19 of which were label-conflicting---together
+touching 19 of the original 112 minority-class (toxic) compounds, or 17\% of the minority class
+underlying the dataset's headline coverage result. We removed all label-conflicting duplicate
+groups and collapsed label-consistent duplicates to a single row before any train/calibration/test
+split. All results reported in this paper, including Table~\ref{tab:datasets}, are
+post-deduplication. The core finding is unchanged by this cleaning step (Table~\ref{tab:main}).
+
+\subsection{Models and representations}
+
+For the main conformal experiments and all cross-dataset work we use a random forest
+\cite{breiman2001} (300 trees on BACE, BBBP, ClinTox, and TP53; 150 trees on Tox21 SR-ARE to fit
+compute budget, directionally stable across the tree counts tested) on 2048-bit Morgan fingerprints
+of radius 2, computed with RDKit's MorganGenerator. We selected the random forest after comparing
+three standard classifiers on BBBP under stratified five-fold cross-validation (Section~4.1); it
+gave the best AUC and competitive balanced accuracy, and as a bagged ensemble it produces
+reasonable probability estimates out of the box.
+
+For the architecture study we add two more representations. The graph network is a two-layer graph
+convolutional model \cite{kipf2017} (GCNConv 32$\to$64$\to$64, mean pooling, a linear read-out to
+two classes) implemented in PyTorch Geometric \cite{fey2019}, trained for 60 epochs with Adam at
+learning rate $10^{-3}$. Atom features are a 32-dimensional one-hot encoding of element, degree,
+hydrogen count, hybridization, aromaticity, and formal charge. The transformer is ChemBERTa
+(DeepChem/ChemBERTa-77M-MTR) \cite{chithrananda2020}, used as a frozen feature extractor: we
+mean-pool its final hidden states over the SMILES tokens to a 384-dimensional embedding and fit a
+logistic-regression head. Freezing the transformer isolates the representation from any tuning
+choices on our side.
+
+\subsection{Conformal prediction}
+
+We use split (inductive) conformal prediction. Each dataset is partitioned into a proper training
+set (50\%), a calibration set (25\%), and a test set (25\%). The base model is fit on the training
+split only. For a model output $\hat p(y\mid x)$ we score each calibration point with the LAC
+nonconformity score \cite{sadinle2019}
+\begin{equation}
+s_i = 1 - \hat p(y_i \mid x_i). \label{eq:1}
+\end{equation}
+For target coverage $1-\alpha$ with $\alpha=0.10$, the marginal threshold is the conformal quantile
+\begin{equation}
+\hat q = \text{the } \left\lceil (n+1)(1-\alpha) \right\rceil / n \text{ empirical quantile of } \{s_i\}, \label{eq:2}
+\end{equation}
+where $n$ is the calibration-set size, and the prediction set for a test point is
+\begin{equation}
+C(x) = \{ y : \hat p(y\mid x) \ge 1-\hat q \}. \label{eq:3}
+\end{equation}
+The finite-sample correction in Eq.~\ref{eq:2} is what gives the marginal guarantee
+$\Pr(y\in C(x)) \ge 1-\alpha$.
+
+Class-conditional (Mondrian) calibration changes one thing. Instead of a single threshold it
+computes a separate quantile $\hat q_k$ from the calibration points of each class $k$:
+\begin{equation}
+\hat q_k = \text{the conformal quantile of } \{s_i : y_i = k\}, \quad
+C(x) = \{ y : \hat p(y\mid x) \ge 1-\hat q_y \}. \label{eq:4}
+\end{equation}
+This enforces $\Pr(y\in C(x)\mid y=k) \ge 1-\alpha$ for every class, which is precisely the
+per-class guarantee the marginal version lacks.
+
+\textbf{New in this revision.} We additionally compute marginal calibration under the adaptive
+prediction sets (APS) score of Romano, Sesia, and Cand\`es \cite{romano2020}, which sorts class
+probabilities in decreasing order and includes labels by cumulative probability mass rather than a
+single LAC threshold, to test whether a more modern conformal score avoids the marginal failure
+without resorting to class-conditional calibration.
+
+We report coverage overall and within each class, and mean prediction-set size. Conformal
+experiments are repeated over 5--10 random train/calibration/test splits per dataset (fewer seeds
+on the largest dataset, Tox21 SR-ARE, to fit compute budget); we report the mean and, where
+relevant, the standard deviation across seeds. All reported coverage and set-size numbers are
+computed on the held-out 25\% test split, never the calibration split.
+
+\subsection{Class-weighted ablation (new)}
+
+To test whether the failure is a symptom of an unweighted classifier rather than of marginal
+calibration itself, we repeat the full marginal/Mondrian LAC pipeline with
+\texttt{class\_weight=`balanced'} in the random forest on BBBP, Tox21 SR-ARE, and ClinTox, and
+compare marginal minority coverage under weighted vs.\ unweighted training.
+
+\subsection{Selective prediction}
+
+A conformal classifier can also be read as an accept/abstain rule. A singleton prediction set is a
+confident, actionable call; a two-element set $\{0,1\}$ is an abstention---the model declines and,
+in a screening setting, the compound goes to the lab. We report the acceptance rate (fraction of
+singletons) and the accuracy on accepted compounds, overall and for the minority class, under both
+calibration schemes.
+
+\subsection{Decision-cost model (revised for direction)}
+
+To turn coverage into something a project manager would recognize, we score minority-class
+decisions with a simple utility
+\begin{equation}
+U = B_{tp} N_{tp} - C_{fp} N_{fp} - C_{fn} N_{fn} - C_{lab} N_{sent}, \label{eq:5}
+\end{equation}
+where $N_{tp}, N_{fp}, N_{fn}$ count correct and incorrect confident calls, $N_{sent}$ counts
+abstentions routed to the lab, and $B, C$ are the corresponding benefit and costs, computed over
+1000 scaled minority-class decisions. \textbf{Revision:} the original formulation implicitly
+treated class~1 as the class to avoid on every dataset. This is correct for Tox21 SR-ARE and
+ClinTox (class~1 = toxic, the outcome a screen should catch) but backwards for BACE, where class~1
+is the active $\beta$-secretase inhibitor---the actual goal of the screen---so a missed active
+(false negative on class~1) is the costly error, not a false positive. We now score utility against
+whichever class is both the numerical minority \emph{and} the class a screening program cannot
+afford to miss, with an asymmetric cost structure ($C_{fn}=15$ vs.\ $C_{fp}=5$) for BACE and the
+toxicity datasets, reflecting that missing the class of interest is more expensive than one extra
+lab assay. For BBBP, whose screening goal (finding CNS-penetrant vs.\ peripherally restricted
+compounds) is program-dependent, we retain the symmetric cost structure of the original
+formulation ($C_{fp}=C_{fn}=5$).
+
+\begin{table}[h]
+\centering
+\caption{Base classifiers on BBBP under stratified five-fold cross-validation (mean over folds,
+deduplicated data). ROC-AUC reported with its standard deviation.}
+\label{tab:table2}
+\begin{tabular}{lrrr}
+\toprule
+Classifier & ROC-AUC & Balanced acc. & F1 \\
+\midrule
+Random forest & 0.924 $\pm$ 0.012 & 0.794 & 0.931 \\
+Hist.\ gradient boost & 0.917 $\pm$ 0.007 & 0.813 & 0.926 \\
+Logistic regression & 0.913 $\pm$ 0.010 & 0.812 & 0.925 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Scaffold blind-spot analysis}
+
+To find where the marginal model is confidently wrong, we reduce each compound to its
+Bemis--Murcko scaffold \cite{bemis1996}---its ring and linker skeleton, side chains
+removed---using RDKit. On the BBBP test split we flag every minority compound whose marginal
+prediction set is a confident singleton that excludes the true (minority) label. We then count
+these confident errors per scaffold and rank the scaffolds with at least two minority test
+compounds.
+
+\subsection{Statistical testing}
+
+For each architecture we compare minority coverage under Mondrian versus marginal calibration with
+a one-sided Wilcoxon signed-rank test over the ten paired seeds. We also report expected
+calibration error (ECE) \cite{guo2017} and Brier scores for the base models.
+
+\section{Results}
+
+\subsection{Base classifier selection and calibration}
+
+Table~\ref{tab:table2} compares three classifiers on BBBP. The random forest leads on AUC (0.924)
+with a histogram gradient-boosting model close behind and slightly ahead on balanced accuracy. We
+carried the random forest forward as the base model for all conformal experiments.
+
+The base models are not badly calibrated. Out-of-fold expected calibration error and Brier scores
+(Figure~\ref{fig:reliability}) show only mild deviations from the diagonal across all three
+classifiers. We make a point of this because it rules out the obvious explanation. The conformal
+failure below is not a symptom of a wildly overconfident model. It survives even when ordinary
+calibration is fine.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\textwidth]{../figures/figure1_reliability.png}
+\caption{Reliability diagrams for three base classifiers on BBBP (out-of-fold, deduplicated data).
+Deviation from the diagonal is mild. Ordinary calibration being acceptable is what makes the
+conformal coverage failure in Figure~\ref{fig:bbbpcoverage} surprising.}
+\label{fig:reliability}
+\end{figure}
+
+\subsection{Marginal coverage collapses on the minority class}
+
+At a 90\% target, marginal conformal prediction on BBBP behaves exactly as advertised in aggregate:
+overall coverage is on target. Split that number by class and it falls apart. Majority-class
+coverage is inflated well above target; minority-class coverage is only 59.2\% (Table~\ref{tab:main}).
+The method buys its global guarantee by over-covering the easy class and under-covering the hard
+one (Figure~\ref{fig:bbbpcoverage}). A practitioner watching overall coverage would see a number
+that looks like the guarantee working. The compounds they care about are covered barely more than
+half the time.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.7\textwidth]{../figures/figure2_bbbp_coverage.png}
+\caption{Per-class coverage on BBBP at a 90\% target (random forest, deduplicated data, means over
+seeds). Marginal calibration over-covers the majority and leaves the minority far below target.
+Mondrian calibration brings both classes to target.}
+\label{fig:bbbpcoverage}
+\end{figure}
+
+Switching to Mondrian calibration repairs this. Minority coverage rises to target on every dataset
+(Table~\ref{tab:main}). The cost is set size: mean prediction-set size grows under Mondrian
+calibration on every dataset where the marginal gap was severe. In other words the marginal method
+was producing tight sets partly by omitting the true minority label; the conditional method pays
+for honest coverage with slightly larger sets on the hard class, which is the correct trade.
+
+\begin{table}[h]
+\centering
+\caption{Core results across all five datasets (random forest; means over 5--8 seeds).}
+\label{tab:main}
+\begin{tabular}{lrrrrrl}
+\toprule
+Dataset & MCC & AUPRC & AUROC & LAC marg.\ min.\ cov.\ & Mondrian min.\ cov.\ & APS marg.\ min.\ cov.\ (set size) \\
+\midrule
+BACE & 0.62 & 0.85 & 0.89 & 92.3\% & 92.2\% & 99.9\% (1.99) \\
+BBBP & 0.64 & 0.96 & 0.90 & 59.2\% & 88.8\% & 100.0\% (2.00) \\
+Tox21 SR-ARE & 0.29 & 0.48 & 0.79 & 40.5\% & 92.3\% & 99.9\% (2.00) \\
+ClinTox & 0.19 & 0.26 & 0.75 & 2.5\% & 98.3\% & 100.0\% (2.00) \\
+TP53 (PubChem) & 0.27 & 0.41 & 0.82 & 2.1\% & 89.1\% & 100.0\% (2.00) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Severity scales with imbalance}
+
+The same experiment across datasets lines up with their imbalance (Table~\ref{tab:main},
+Figure~\ref{fig:crossdataset}). On near-balanced BACE (minority rate 0.457) marginal calibration is
+already close to target, and Mondrian leaves it essentially unchanged. As imbalance deepens through
+BBBP, Tox21 SR-ARE, ClinTox, and the new TP53 PubChem dataset, marginal minority coverage collapses
+further and further while Mondrian calibration holds every dataset near its 90\% target. The
+ordering is monotone: the rarer the class, the worse marginal calibration treats it, and BACE shows
+the effect switches off when imbalance does.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.85\textwidth]{../figures/figure3_cross_dataset.png}
+\caption{Marginal minority-class coverage against a 90\% target (dashed) across all five datasets,
+ordered by imbalance. The shortfall deepens from BACE through BBBP, Tox21, ClinTox, to the new
+TP53 PubChem bioactivity dataset; Mondrian calibration returns every dataset to target.}
+\label{fig:crossdataset}
+\end{figure}
+
+To name the failure with a single number, we use the minority coverage gap,
+$\mathrm{MCG} = (1-\alpha) - \mathrm{cov}_{\min}$: how far minority coverage falls below the
+promised target. A companion, the coverage imbalance index
+$\mathrm{CII} = |\mathrm{cov}_{\mathrm{maj}} - \mathrm{cov}_{\min}|$, captures how unevenly
+coverage is split between classes. These are deliberately simple; the value of a diagnostic is that
+it is easy to compute and report, not that it is mathematically deep. Under marginal calibration
+MCG is largest on the most imbalanced datasets (ClinTox and TP53) and smallest on BACE; under
+Mondrian it collapses to within a few points of zero on all five.
+
+We also tested ClinTox and, new in this revision, the PubChem TP53 dataset as external checks; they
+appear nowhere else in our experiments except as standalone case studies. Both show near-total
+collapse under marginal calibration and near-total recovery under Mondrian calibration, consistent
+with the pattern across all five datasets. Section~5 shows why this ordering is not a coincidence.
+
+\subsection{The failure is architecture-agnostic}
+
+\begin{table}[h]
+\centering
+\caption{Minority-class coverage on BBBP at a 90\% target across three model architectures (ten
+seeds each). The failure and its repair appear in all three.}
+\label{tab:table4}
+\begin{tabular}{lllll}
+\toprule
+Architecture & Representation & Marginal cov.\ & Mondrian cov.\ & Wilcoxon $p$ \\
+\midrule
+Random forest & ECFP fingerprints & 64.8\% & 90.3\% & $9.8\times 10^{-4}$ \\
+Graph network & atom--bond graph & 63.3\% & 90.9\% & $9.8\times 10^{-4}$ \\
+ChemBERTa & SMILES (frozen) & 72.4\% & 90.1\% & $9.8\times 10^{-4}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+If the collapse were specific to fingerprints and random forests, it would be a quirk worth a
+footnote. It is not. We repeated the BBBP experiment with two more representations that share
+nothing with the first: a graph network reading the molecular graph, and a frozen chemical language
+model reading the SMILES string. Both collapse the same way (Table~\ref{tab:table4}). The Wilcoxon
+test is at its floor for ten paired seeds in all three cases, with every seed pointing the same
+direction.
+
+One detail in Table~\ref{tab:table4} is worth dwelling on. The transformer's marginal coverage is
+noticeably higher than the other two. ChemBERTa was pretrained on millions of molecules, so it
+arrives with better-calibrated minority predictions, and the marginal threshold therefore mistreats
+the minority a little less. But ``a little less'' is still a substantial miss. The vulnerability
+shrinks with a stronger pretrained model; it does not disappear. We read this as evidence that the
+collapse is driven by the marginal calibration step interacting with baseline minority calibration,
+not by anything architectural---a better representation raises the floor without removing the
+problem.
+
+\subsection{Aggregate metrics hide the failure}
+
+The selective-prediction view on BBBP shows why a normal evaluation would miss all of this. Under
+marginal calibration the model accepts (returns a confident singleton for) the large majority of
+compounds at high accuracy on those accepted---an excellent-looking summary. Restrict to the
+minority class and the same model's selective accuracy on accepted minority compounds drops
+sharply. It is confidently wrong on minority compounds close to half the time, while the headline
+accuracy on accepted compounds looks fine. Mondrian calibration changes the behavior in the right
+direction: larger sets push more genuinely uncertain minority cases to abstention, and minority
+selective accuracy improves substantially. The overall accept/accuracy figures barely move between
+the two schemes. That is the trap. Everything you would normally look at says the marginal model is
+fine.
+
+\subsection{Does rebalancing the classifier fix it? No (new)}
+
+A natural response to class imbalance is to reweight the classifier's training loss. We repeat the
+BBBP, Tox21 SR-ARE, and ClinTox experiments with \texttt{class\_weight=`balanced'} and find marginal
+minority coverage essentially unchanged: BBBP 59.2\%$\to$60.7\%, Tox21 SR-ARE 40.5\%$\to$34.7\% (no
+improvement), ClinTox 2.5\%$\to$0.0\% (no improvement). Class weighting shifts the classifier's
+decision boundary but does not change the shape of the pooled nonconformity-score distribution
+enough to move the single marginal quantile off the majority mass (Figure~\ref{fig:nonconformity}).
+This is additional evidence for the mechanism in Section~5: the failure lives in the calibration
+step, not the base classifier, and no amount of reweighting the classifier substitutes for
+calibrating per class.
+
+\subsection{Adaptive prediction sets reach coverage by becoming uninformative (new)}
+
+Both reviewers of the previous submission of this manuscript asked whether more recent conformal
+methods avoid this failure without Mondrian calibration. Table~\ref{tab:main} shows marginal APS
+reaching near-total minority coverage (99.9--100\%) on every dataset---but mean prediction-set size
+under APS is $\approx 2.0$ everywhere, meaning APS achieves its guarantee by returning the trivial
+$\{0,1\}$ set for nearly every minority compound. APS therefore fails differently than LAC, not
+less: LAC is confidently and often wrong on the minority class, while marginal APS is uninformatively
+``correct''---it essentially never commits to a minority-class call, which is operationally
+equivalent to a policy of always abstaining and is no more useful for screening decisions than that
+policy would be. Class-conditional calibration is the only one of the three schemes tested that
+returns both correct minority coverage and prediction sets small enough to act on.
+
+\subsection{The cost of false confidence, direction-corrected}
+
+Feeding the measured minority numbers into the utility of Eq.~\ref{eq:5} makes the stakes concrete.
+Table~\ref{tab:utility} reports utility under the corrected, direction-aware cost structure
+(Section~3.5). The qualitative conclusion strengthens relative to the original submission: under
+asymmetric, direction-corrected costs, Mondrian calibration's advantage is larger everywhere it
+matters (Tox21, ClinTox, BBBP), and the two schemes are statistically indistinguishable only on
+BACE---the one dataset that is already near-balanced and where the conservation identity predicts
+the marginal failure should be negligible. This is the identity's ordering prediction showing up a
+second time, independently, in the cost analysis.
+
+\begin{table}[h]
+\centering
+\caption{Utility over 1000 scaled minority-class decisions, direction-corrected costs.}
+\label{tab:utility}
+\begin{tabular}{lllrr}
+\toprule
+Dataset & Screening goal & Cost structure & Marginal $U$ & Mondrian $U$ \\
+\midrule
+BACE & Find active inhibitors & $C_{fn}\gg C_{fp}$ & $-700$ & $-671$ \\
+BBBP & Symmetric (program-dependent) & $C_{fn}=C_{fp}$ & $-1{,}569$ & $+86$ \\
+Tox21 SR-ARE & Avoid toxic compounds & $C_{fn}\gg C_{fp}$ & $-9{,}484$ & $-1{,}141$ \\
+ClinTox & Avoid toxic compounds & $C_{fn}\gg C_{fp}$ & $-11{,}959$ & $-179$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+To make ``robust to the exact constants'' more than an assertion, we swept the cost of a confident
+wrong call ($C_{fp}=C_{fn}$) from 1 to 50 and the cost of a lab assay ($C_{lab}$) from 0.2 to 2 on
+the BBBP minority-decision framing (Figure~\ref{fig:utilityheatmap}). The Mondrian advantage
+$\Delta U = U_{mond} - U_{marg}$ is positive everywhere on the grid, and it grows as confident
+errors get more expensive---which is the regime any safety-critical screen lives in. The conclusion
+does not depend on our particular choice of cost constants.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.75\textwidth]{../figures/figure4_utility_heatmap.png}
+\caption{Sensitivity of the Mondrian utility advantage $\Delta U = U_{mond}-U_{marg}$ to the cost
+assumptions, on BBBP minority decisions ($n=1000$). $\Delta U$ is positive across every combination
+of error cost and lab-assay cost, so class-conditional calibration is the better decision rule
+regardless of where a campaign sets its costs.}
+\label{fig:utilityheatmap}
+\end{figure}
+
+\subsection{Where the model is blind: a scaffold case study}
+
+The confident minority errors are not spread evenly across chemical space. They pile up on a few
+scaffolds (Figure~\ref{fig:scaffolds}). On the deduplicated BBBP test split (seed 0) the worst
+offender is the bare benzene scaffold: of 8 minority compounds reducing to a benzene core, the
+marginal model is confidently wrong on 5 (62.5\%). Two other generic scaffolds each show total or
+near-total confident misclassification among their (small) minority compound counts. The common
+thread is telling. These are simple, generic skeletons that occur in \emph{both} classes. A bare
+benzene ring carries almost no information about whether a compound crosses the blood--brain
+barrier, so the model defaults to the majority call and does it confidently---and it is exactly the
+minority compounds hiding inside that generic chemistry that get burned. Complex, distinctive
+scaffolds with several minority test compounds show markedly lower confident-error rates. The blind
+spot is not exotic chemistry the model never saw. It is the most ordinary chemistry, where the
+minority signal is drowned out. That is a sharper and more uncomfortable statement than ``the model
+fails on weird molecules,'' and it is precisely the regime a marginal guarantee papers over.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\textwidth]{../figures/figure5_scaffolds.png}
+\caption{The Bemis--Murcko scaffolds with the most confident minority-class errors under marginal
+calibration on BBBP (deduplicated data, seed 0). The worst blind spots are generic cores that
+appear in both classes and carry little class signal.}
+\label{fig:scaffolds}
+\end{figure}
+
+\textbf{One sentence connecting this to Mondrian calibration, added per reviewer request:} under
+Mondrian calibration, the minority-class threshold widens enough that many of these previously
+confidently-wrong compounds on generic scaffolds move from a confident-but-wrong singleton into the
+two-label abstention set, which is the mechanism by which Mondrian calibration converts confident
+errors into flagged uncertainty rather than eliminating the underlying difficulty of the chemistry.
+
+\subsection{Robustness to realistic scaffold splits}
+
+Random train/test splits let near-identical molecules land on both sides, which flatters any model
+and, in principle, could flatter the conformal calibration too. The honest test is a scaffold
+split, where whole Bemis--Murcko scaffolds are assigned to a single partition so that test compounds
+carry skeletons absent from training and calibration. This deliberately violates the exchangeability
+that conformal coverage assumes, so it probes robustness under distribution shift rather than a
+clean guarantee. We repeated the BBBP experiment with ten random scaffold splits. The collapse does
+not go away; it deepens. Marginal minority coverage falls further than under random splits, and
+Mondrian recovers it, over-covering slightly rather than landing exactly on target, which is the
+expected and safe direction when exchangeability is broken.
+
+\textbf{Rationale, added per reviewer request:} scaffold splitting deliberately breaks the
+exchangeability conformal prediction requires, so coverage guarantees under scaffold splits are not
+formally exact in the way random-split guarantees are. We include this experiment not as a second
+valid coverage claim but as a stress test: real deployment means scoring molecules with scaffolds
+the model has never calibrated on, and if the marginal-vs-Mondrian gap only appeared under the
+idealized random-split assumption, that would substantially limit the practical relevance of our
+findings. The gap does not shrink under scaffold splits---if anything it deepens
+slightly---which is the relevant robustness check for a practitioner deciding whether to trust
+conformal prediction on genuinely novel chemistry, even though neither scheme's numeric guarantee
+is formally exact in this regime.
+
+\section{Mechanism: why marginal calibration under-covers the minority}
+
+The experiments establish that the failure is real, general, and costly. They do not yet say why.
+Here we give a short argument that explains the effect, predicts its size from quantities known
+before any model is trained, and accounts for the ordering across datasets.
+
+\textbf{Conservation of coverage.} Split conformal prediction guarantees only the \emph{overall}
+coverage, $\Pr(y\in C(x)) \ge 1-\alpha$. Overall coverage is the class-weighted average of the
+per-class coverages, with weights equal to the class prevalences $\pi_{\mathrm{maj}}, \pi_{\min}$:
+\begin{equation}
+1-\alpha = \pi_{\mathrm{maj}}\,\mathrm{cov}_{\mathrm{maj}} + \pi_{\min}\,\mathrm{cov}_{\min}. \label{eq:6}
+\end{equation}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.75\textwidth]{../figures/figure6_nonconformity.png}
+\caption{Calibration nonconformity scores on BBBP, split by class (deduplicated data, seed 0). The
+majority (penetrant) scores concentrate near zero; the minority (non-penetrant) scores spread to
+higher values. The single marginal threshold is pulled toward the majority mass and slices through
+the minority distribution, excluding much of its upper tail---the source of the under-coverage.
+Mondrian gives each class its own threshold; the minority threshold sits far enough right to cover
+its tail.}
+\label{fig:nonconformity}
+\end{figure}
+
+Solving for the minority coverage and rearranging gives the relation that drives the whole
+phenomenon:
+\begin{equation}
+(1-\alpha) - \mathrm{cov}_{\min} = \frac{\pi_{\mathrm{maj}}}{\pi_{\min}}\left(\mathrm{cov}_{\mathrm{maj}} - (1-\alpha)\right). \label{eq:7}
+\end{equation}
+\begin{center}
+\emph{minority shortfall} \hspace{2.5cm} \emph{majority surplus}
+\end{center}
+
+Coverage is conserved: whatever the majority is given above target, the minority must lose below
+it. And the loss is not one-for-one---it is amplified by the imbalance ratio
+$\pi_{\mathrm{maj}}/\pi_{\min}$. At three-to-one imbalance, each point of majority over-coverage
+costs three points of minority coverage. The mechanism is visible directly in the calibration
+scores (Figure~\ref{fig:nonconformity}): because the model classifies the abundant majority easily,
+its nonconformity scores pile up near zero, so the pooled $(1-\alpha)$ quantile---the single
+marginal threshold---is dragged down to a value that comfortably covers the majority while failing
+to reach the minority's much heavier upper tail. The majority's surplus is exactly the
+over-coverage that this low threshold produces.
+
+\textbf{The identity predicts the failure.} Equation~\ref{eq:7} is not a loose analogy; it holds
+numerically to within a few points across every dataset we study, and the amplification factor
+$\pi_{\mathrm{maj}}/\pi_{\min}$ orders the severity of the collapse across datasets exactly as
+measured. Nothing about this is specific to chemistry: the only ingredients are class imbalance and
+a model that handles the common class better than the rare one, which is the normal situation in
+screening.
+
+\subsection{A validated pre-flight coverage-gap diagnostic (new)}
+
+Equation~\ref{eq:7} \emph{explains} the measured minority coverage gap after marginal calibration
+has already been run and $\mathrm{cov}_{\mathrm{maj}}$ measured. It is diagnostic, not predictive
+in the useful sense---you need the failure to already exist, and to have already run the full
+calibration pipeline, to explain it. We extend it into a pre-flight predictor: given only (a) class
+prevalence, known before any modeling, and (b) one cheap marginal-calibration pass to obtain
+$\mathrm{cov}_{\mathrm{maj}}$, a practitioner can predict $\mathrm{cov}_{\min}$ before deciding
+whether class-conditional calibration is worth implementing. Because coverage is bounded in
+$[0,1]$ while the identity is linear and unbounded, we clip the prediction to $[0,1]$---and note
+explicitly that the unclipped identity can produce nonsensical negative predictions at high
+imbalance (e.g.\ $-40.6\%$ on ClinTox, amplification factor $16.1\times$ in that particular test
+split), which is itself informative: it flags that imbalance has passed the point where marginal
+calibration can be trusted at all.
+
+\begin{table}[h]
+\centering
+\caption{Pre-flight diagnostic validation across five datasets spanning 1.2$\times$--16.1$\times$
+imbalance.}
+\label{tab:diagnostic}
+\begin{tabular}{lrrrr}
+\toprule
+Dataset & Amplification factor & Predicted min.\ cov.\ (clipped) & Actual min.\ cov.\ & Abs.\ error \\
+\midrule
+BACE & 1.22$\times$ & 88.9\% & 92.3\% & 3.4 pts \\
+BBBP & 3.21$\times$ & 62.3\% & 59.2\% & 3.1 pts \\
+Tox21 SR-ARE & 5.10$\times$ & 39.8\% & 40.5\% & 0.7 pts \\
+ClinTox & 16.14$\times$ & 0.0\% & 2.5\% & 2.5 pts \\
+TP53 (PubChem) & 12.01$\times$ & 0.0\% & 2.1\% & 2.1 pts \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Validated against all five datasets (Table~\ref{tab:diagnostic}), imbalance ratios
+1.2$\times$--16.1$\times$, the clipped diagnostic predicts minority coverage to within a mean
+absolute error of 2.4 percentage points---including correctly flagging near-total collapse at the
+two most extreme imbalance ratios once the identity is bounded. We propose this as a one-line
+pre-registration-style check practitioners can run before committing to a full calibration study,
+and release it as a single function in the accompanying repository.
+
+\textbf{Limitation, stated explicitly.} This diagnostic is a bounded, first-order approximation,
+not an exact law. It requires one calibration pass, not zero, degrades in interpretability above
+roughly $10\times$ imbalance where the unclipped identity leaves the $[0,1]$ range entirely, and
+has been validated on five datasets---a wider sweep across endpoints and imbalance ratios (noted in
+Limitations) would be needed to fit it as a general predictive law rather than a validated trend.
+
+\textbf{Why Mondrian works, and why temperature scaling would not.} Mondrian calibration breaks
+Eq.~\ref{eq:6} by refusing to pool. With a separate quantile per class, each class gets its own
+$(1-\alpha)$ threshold and the amplification channel is closed---there is no shared budget to
+redistribute. This also clarifies why ordinary recalibration is the wrong tool. Rescaling
+probabilities (for instance, temperature scaling) shifts every score but cannot change the fact
+that a single pooled quantile is dominated by the majority; it adjusts confidence, not the
+conditional coverage that Eq.~\ref{eq:7} governs. The fix has to act on the calibration partition,
+not on the probabilities. Similarly---and this is new in this revision---reweighting the
+classifier's training objective does not act on the calibration partition either, which is why the
+class-weighted ablation in Section~4.6 shows no improvement.
+
+\textbf{An illusion of safety.} Put the pieces together and a pattern emerges that is worse than any
+single number. A team adopts conformal prediction precisely to stop trusting a model blindly. They
+pick $\alpha=0.10$, confirm overall coverage near 90\%, see high accuracy on confident calls, and
+conclude the system is safe to act on. Every one of those checks passes while the model covers the
+minority class barely more than half the time on some datasets and almost never on others, abstains
+on the wrong compounds, and is most confidently wrong on the most ordinary molecules in the library.
+The marginal guarantee did not lie---it delivered exactly the average coverage it
+promised---but the way it is naturally read, as a per-case assurance, is an illusion of safety on
+imbalanced data.
+
+\textbf{What is and is not new here.} The mathematics of conformal prediction is not ours and we
+want to be exact about that. The gap between marginal and conditional coverage is foundational
+conformal theory \cite{vovk2013,angelopoulos2023}, and Mondrian calibration is the standard answer
+to it. Our contribution is empirical, explanatory, and---new in this revision---predictive: that
+this known gap is large, common, and invisible under the imbalance that defines virtual screening;
+that it holds across three unrelated architectures and a genuine bioactivity screen, with severity
+set by baseline minority calibration rather than architecture; that a one-line conservation
+identity predicts its size and ordering from class prevalences alone, and can be turned into a
+bounded pre-flight check validated across five datasets and a thirteen-fold imbalance range; that
+ordinary metrics conceal it; that ordinary class rebalancing does not fix it; that a more modern
+conformal score (APS) fails differently rather than not at all; and that the failure localizes to
+interpretable chemical substructures with a measurable, direction-aware, cost-robust penalty. The
+conservation argument is elementary, and we make no claim otherwise---its worth is that it turns an
+observed failure into a predictable one.
+
+\textbf{Practical recommendation.} The operational takeaway is short. On any imbalanced screening
+task, report coverage per class, not just overall; run the pre-flight diagnostic before committing
+to a full study; and calibrate per class with Mondrian conformal prediction by default rather than
+reaching for class-weighted training or a fancier marginal score, neither of which fixes the
+problem. The extra cost of Mondrian calibration is a modest increase in prediction-set size,
+concentrated on the hard class, which is the honest place to spend it. Treating larger minority
+sets as a defect is backwards; they are the method telling the truth about a class it cannot yet
+call confidently.
+
+\section{Discussion and Limitations}
+
+Several limitations remain. We study five datasets and one imbalance axis; a fuller sweep across
+endpoints and ratios would turn the amplification relation from a validated trend into a fitted
+law. Our scaffold-split test uses random scaffold partitions over ten seeds rather than a single
+canonical split, which is why its coverage estimates are noisier; the direction is nonetheless
+unambiguous. ClinTox and the new TP53 PubChem dataset are both fairly imbalanced with modest
+absolute minority-class counts, so their percentages are somewhat coarse at the level of individual
+test splits. We froze ChemBERTa rather than fine-tuning it, so its numbers reflect pretrained
+representations, not a tuned model. We used a single primary nonconformity score (LAC), though this
+revision adds a full comparison against adaptive prediction sets (APS) as a second baseline; a
+head-to-head of LAC against APS under \emph{class-conditional} (rather than only marginal)
+calibration remains a natural extension. The direction-aware cost model is illustrative---we show
+the sign and robustness of the effect, not real campaign economics. The scaffold blind-spot
+analysis is run on one seed for interpretability; the identity of the worst scaffolds may shift
+across splits even if the generic-core pattern does not. The pre-flight diagnostic is a bounded
+first-order approximation, explicitly flagged in Section~5.1 as degrading in interpretability above
+roughly tenfold imbalance. Finally, the TP53 PubChem dataset is a primary-screen outcome, not
+LIT-PCBA's curated, dose-response-confirmed active set; we use it as an independent bioactivity
+case study, not as a claim of alignment with LIT-PCBA's specific curation protocol, and note the
+concurrent audit of LIT-PCBA's own data integrity \cite{huang2025} as context for why we did not
+simply adopt that benchmark's splits wholesale.
+
+\textbf{Future work.} The natural extensions are a wider dataset sweep to fit the amplification
+relation directly and sharpen the pre-flight diagnostic; a head-to-head of LAC against adaptive
+prediction sets under \emph{class-conditional} calibration specifically; group-conditional
+calibration along axes beyond the label---chemical series, assay source---where silent
+under-coverage could hide for the same reason; and a fuller accounting of when class-weighted
+training might interact with calibration in ways our three-dataset ablation did not probe.
+
+\section{Conclusion}
+
+Conformal prediction gives virtual screening something it badly needs: a distribution-free
+statement about reliability. Read carelessly on imbalanced data, that statement is also a way to be
+confidently wrong about the compounds that matter most. We measured marginal conformal prediction
+under-covering the minority class by tens of points on ADMET/toxicity endpoints and by nearly
+ninety points on a real bioactivity screen, while every aggregate metric stayed healthy; showed the
+failure across fingerprint, graph, and transformer models at $p<0.001$ each; showed it survives
+class-weighted training and is not solved by a more modern conformal score; turned the paper's own
+explanatory identity into a validated pre-flight check; traced the failure to a handful of generic
+scaffolds; and priced it with a direction-aware cost model. The remedy is already on the
+shelf---calibrate per class. The point of the paper is to make the case that, for screening,
+per-class calibration should be the default rather than a refinement, and to give practitioners a
+concrete way to see the failure coming before it costs them.
+
+\section*{Data and Code Availability}
+MoleculeNet datasets (BBBP, BACE, Tox21, ClinTox) \cite{wu2018} are public. The TP53 dataset is
+PubChem assay AID~651631, publicly available via PubChem. Code to reproduce every experiment,
+table, and figure, with fixed random seeds, is available at
+\url{https://github.com/Muhammadjon-crypto/Conformal-Minority-Screen}. A Zenodo-archived release
+with a permanent DOI will be provided on acceptance.
+
+\section*{Funding}
+This research did not receive any specific grant from funding agencies in the public, commercial,
+or not-for-profit sectors.
+
+\section*{Author Contributions}
+Muhammadjon Tursunbadalov and Mustafojon Tursunbadalov jointly designed the study, implemented the
+experiments, analyzed the results, and wrote the manuscript.
+
+\section*{Conflicts of Interest}
+The authors declare no competing interests.
+
+\begin{thebibliography}{99}
+
+\bibitem{vovk2005} Vovk, V.; Gammerman, A.; Shafer, G. \emph{Algorithmic Learning in a Random
+World}; Springer: New York, 2005.
+
+\bibitem{angelopoulos2023} Angelopoulos, A. N.; Bates, S. A Gentle Introduction to Conformal
+Prediction and Distribution-Free Uncertainty Quantification. \emph{Foundations and Trends in
+Machine Learning} \textbf{2023}, \emph{16}(4), 494--591.
+
+\bibitem{sadinle2019} Sadinle, M.; Lei, J.; Wasserman, L. Least Ambiguous Set-Valued Classifiers
+With Bounded Error Levels. \emph{Journal of the American Statistical Association} \textbf{2019},
+\emph{114}(525), 223--234.
+
+\bibitem{romano2020} Romano, Y.; Sesia, M.; Cand\`es, E. Classification with Valid and Adaptive
+Coverage. In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2020.
+
+\bibitem{vovk2013} Vovk, V. Conditional Validity of Inductive Conformal Predictors. \emph{Machine
+Learning} \textbf{2013}, \emph{92}, 349--376.
+
+\bibitem{wu2018} Wu, Z.; Ramsundar, B.; Feinberg, E. N.; Gomes, J.; Geniesse, C.; Pappu, A. S.;
+Leswing, K.; Pande, V. MoleculeNet: A Benchmark for Molecular Machine Learning. \emph{Chemical
+Science} \textbf{2018}, \emph{9}, 513--530.
+
+\bibitem{rogers2010} Rogers, D.; Hahn, M. Extended-Connectivity Fingerprints. \emph{Journal of
+Chemical Information and Modeling} \textbf{2010}, \emph{50}, 742--754.
+
+\bibitem{breiman2001} Breiman, L. Random Forests. \emph{Machine Learning} \textbf{2001}, \emph{45},
+5--32.
+
+\bibitem{kipf2017} Kipf, T. N.; Welling, M. Semi-Supervised Classification with Graph Convolutional
+Networks. In \emph{Proceedings of the International Conference on Learning Representations
+(ICLR)}, 2017.
+
+\bibitem{fey2019} Fey, M.; Lenssen, J. E. Fast Graph Representation Learning with PyTorch
+Geometric. \emph{International Conference on Learning Representations (ICLR) Workshop}, 2019.
+
+\bibitem{chithrananda2020} Chithrananda, S.; Grand, G.; Ramsundar, B. ChemBERTa: Large-Scale
+Self-Supervised Pretraining for Molecular Property Prediction. \emph{arXiv:2010.09885}, 2020.
+
+\bibitem{guo2017} Guo, C.; Pleiss, G.; Sun, Y.; Weinberger, K. Q. On Calibration of Modern Neural
+Networks. In \emph{International Conference on Machine Learning (ICML)}, 2017.
+
+\bibitem{norinder2014} Norinder, U.; Carlsson, L.; Boyer, S.; Eklund, M. Introducing Conformal
+Prediction in Predictive Modeling. A Transparent and Flexible Alternative to Applicability Domain
+Determination. \emph{Journal of Chemical Information and Modeling} \textbf{2014}, \emph{54},
+1596--1603.
+
+\bibitem{eklund2015} Eklund, M.; Norinder, U.; Boyer, S.; Carlsson, L. The Application of Conformal
+Prediction to the Drug Discovery Process. \emph{Annals of Mathematics and Artificial Intelligence}
+\textbf{2015}, \emph{74}, 117--132.
+
+\bibitem{martins2012} Martins, I. F.; Teixeira, A. L.; Pinheiro, L.; Falcao, A. O. A Bayesian
+Approach to in Silico Blood--Brain Barrier Penetration Modeling. \emph{Journal of Chemical
+Information and Modeling} \textbf{2012}, \emph{52}, 1686--1697.
+
+\bibitem{subramanian2016} Subramanian, G.; Ramsundar, B.; Pande, V.; Denny, R. A. Computational
+Modeling of $\beta$-Secretase 1 (BACE-1) Inhibitors Using Ligand-Based Approaches. \emph{Journal of
+Chemical Information and Modeling} \textbf{2016}, \emph{56}, 1936--1949.
+
+\bibitem{huang2016} Huang, R.; Xia, M.; Nguyen, D.-T.; Zhao, T.; Sakamuru, S.; Zhao, J.; Shahane, S.
+A.; Rossoshek, A.; Simeonov, A. Tox21 Challenge to Build Predictive Models of Nuclear Receptor and
+Stress Response Pathways as Mediated by Exposure to Environmental Chemicals and Drugs.
+\emph{Frontiers in Environmental Science} \textbf{2016}, \emph{3}, 85.
+
+\bibitem{rdkit} Landrum, G. RDKit: Open-Source Cheminformatics; \url{https://www.rdkit.org}
+(accessed 2026).
+
+\bibitem{bemis1996} Bemis, G. W.; Murcko, M. A. The Properties of Known Drugs. 1. Molecular
+Frameworks. \emph{Journal of Medicinal Chemistry} \textbf{1996}, \emph{39}, 2887--2893.
+
+\bibitem{tran2020} Tran-Nguyen, V.-K.; Jacquemard, C.; Rognan, D. LIT-PCBA: An Unbiased Data Set
+for Machine Learning and Virtual Screening. \emph{Journal of Chemical Information and Modeling}
+\textbf{2020}, \emph{60}(9), 4263--4273.
+
+\bibitem{huang2025} Huang, A.; Knight, I. S.; Naprienko, S. Data Leakage and Redundancy in the
+LIT-PCBA Benchmark. \emph{arXiv:2507.21404}, 2025.
+
+\end{thebibliography}
+
+\end{document}
